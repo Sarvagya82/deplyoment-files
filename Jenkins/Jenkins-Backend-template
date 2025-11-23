@@ -1,0 +1,129 @@
+pipeline {
+    agent any
+
+    environment {
+        SSH_CRED      = 'REPLACE_WITH_YOUR_SSH_CREDENTIAL_ID'              // Jenkins SSH credential ID
+        REMOTE_HOST   = 'ec2-XX-XX-XX-XX.region.compute.amazonaws.com'     // Backend server hostname or IP
+        REMOTE_FOLDER = '/home/ubuntu/Backend-App'                        // Deployment directory on remote host
+        GIT_REPO      = 'https://github.com/your-org/backend-app.git'     // Git repository URL for backend
+        GIT_BRANCH    = 'uat'                                             // Target Git branch
+        IMAGE_NAME    = 'backend-app:latest'                              // Docker image name with tag
+        CONTAINER_NAME= 'backend-app-container'                           // Docker container name
+        SECRET_ID     = 'backend-uat-secrets'                             // AWS Secrets Manager secret ID
+        HANGOUTS_TOKEN= credentials('REPLACE_WITH_CHAT_TOKEN_CREDENTIAL') // Chat token credential ID for notifications
+    }
+
+    options {
+        timestamps() // Adds timestamps to pipeline logs for easier debug
+    }
+
+    stages {
+        stage('Notify: Deployment Start') {
+            steps {
+                hangoutsNotify(
+                    message: "🚀 Starting Backend deployment (Build #${env.BUILD_NUMBER})",
+                    token: env.HANGOUTS_TOKEN,
+                    threadByJob: true
+                )
+            }
+        }
+
+        stage('Deploy Backend over SSH') {
+            steps {
+                sshagent(credentials: [env.SSH_CRED]) {
+                    sh '''
+                        #!/usr/bin/env bash
+                        set -euo pipefail
+
+                        echo "[INFO] Connecting to $REMOTE_HOST"
+
+                        ssh -o BatchMode=yes -o StrictHostKeyChecking=no ubuntu@"$REMOTE_HOST" <<'EOF'
+                        set -euo pipefail
+
+                        echo "[STEP] Ensure Docker, Git, AWS CLI, jq are installed"
+                        command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sudo sh
+                        docker compose version >/dev/null 2>&1 || { sudo apt-get update -y; sudo apt-get install -y docker-compose-plugin; }
+                        command -v git >/dev/null 2>&1 || sudo apt-get update -y && sudo apt-get install -y git
+                        command -v aws >/dev/null 2>&1 || sudo apt-get update -y && sudo apt-get install -y awscli jq
+
+                        echo "[STEP] Prepare deployment directory"
+                        sudo mkdir -p "$REMOTE_FOLDER"
+                        sudo chown -R ubuntu:ubuntu "$REMOTE_FOLDER"
+                        cd "$REMOTE_FOLDER"
+
+                        echo "[STEP] Sync source code from $GIT_REPO branch $GIT_BRANCH"
+                        if [ -d .git ]; then
+                          git config --global --add safe.directory "$REMOTE_FOLDER" || true
+                          git fetch --all --prune
+                          git checkout "$GIT_BRANCH" 2>/dev/null || true
+                          git reset --hard "origin/$GIT_BRANCH" || git reset --hard origin/master
+                        else
+                          git clone "$GIT_REPO" .
+                          git checkout "$GIT_BRANCH" 2>/dev/null || true
+                        fi
+
+                        echo "[STEP] Fetch secrets from AWS Secrets Manager and generate .env"
+                        aws secretsmanager get-secret-value \
+                          --secret-id "$SECRET_ID" \
+                          --query SecretString \
+                          --output text | jq -r 'to_entries | map("\\(.key)=\\(.value)") | .[]' > .env
+
+                        chmod 600 .env
+                        chown ubuntu:ubuntu .env
+
+                        echo "[STEP] Stop existing containers and cleanup images"
+                        sudo docker compose down --remove-orphans || true
+                        sudo docker rm -f "$CONTAINER_NAME" || true
+                        sudo docker image prune -f || true
+
+                        echo "[STEP] Build Docker image"
+                        sudo docker build -t "$IMAGE_NAME" .
+
+                        echo "[STEP] Run container"
+                        sudo docker run -d --name "$CONTAINER_NAME" --env-file .env -p 8080:8080 "$IMAGE_NAME"
+
+                        echo "[STEP] Wait for container startup"
+                        sleep 10
+
+                        echo "[STEP] Verify container is running"
+                        if ! sudo docker ps --filter "name=$CONTAINER_NAME" --format "{{.Status}}" | grep -iq '^up'; then
+                            echo "[ERROR] Container $CONTAINER_NAME is not running!"
+                            sudo docker logs --tail=100 "$CONTAINER_NAME" || true
+                            exit 1
+                        fi
+
+                        echo "[STEP] Update logging symlinks and restart CloudWatch agent if installed"
+                        if [ -x /usr/local/bin/update-docker-log-symlinks.sh ]; then
+                          sudo /usr/local/bin/update-docker-log-symlinks.sh || true
+                          sudo systemctl restart amazon-cloudwatch-agent || true
+                        else
+                          echo "[WARN] Log symlink script not found, skipping"
+                        fi
+
+                        echo "[DONE] Backend deployment successful"
+                        EOF
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            hangoutsNotify(
+                message: "✅ Backend deployment SUCCESS (Build #${env.BUILD_NUMBER})",
+                token: env.HANGOUTS_TOKEN,
+                threadByJob: true
+            )
+            echo '✅ Backend deployment completed successfully.'
+        }
+        failure {
+            hangoutsNotify(
+                message: "❌ Backend deployment FAILED (Build #${env.BUILD_NUMBER}). Logs: ${env.BUILD_URL}",
+                token: env.HANGOUTS_TOKEN,
+                threadByJob: true
+            )
+            echo '❌ Deployment failed. Review pipeline logs.'
+        }
+    }
+}
