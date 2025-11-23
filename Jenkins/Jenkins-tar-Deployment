@@ -1,0 +1,79 @@
+pipeline {
+    agent any
+
+    environment {
+        SSH_CRED     = 'REPLACE_WITH_SSH_CREDENTIAL_ID'               // Jenkins SSH credential ID
+        REMOTE_HOST  = 'XX.XX.XX.XX'                                 // Remote server IP or hostname
+        REMOTE_DEPLOY_DIR = '/home/ubuntu/deployment'                // Directory on remote host to extract and deploy
+        LOCAL_TAR_FILE = 'app-deployment.tar'                        // Local TAR file to transfer
+        CONTAINER_NAME = 'my-app-container'                          // Container name to run
+        IMAGE_NAME     = 'my-app-image:latest'                       // Docker image name to load from TAR
+        DOCKER_RUN_CMD = 'docker run -d --name my-app-container -p 8080:8080 my-app-image:latest' // Docker run command
+    }
+
+    stages {
+        stage('Prepare Deployment TAR') {
+            steps {
+                echo "Ensure local TAR file ${env.LOCAL_TAR_FILE} exists or is created before deployment."
+                // This stage can be expanded to build/create the tar file if needed.
+            }
+        }
+
+        stage('Transfer TAR to Remote Server') {
+            steps {
+                sshagent(credentials: [env.SSH_CRED]) {
+                    sh """
+                        echo "Transferring TAR file to remote server..."
+                        scp -o StrictHostKeyChecking=no ${env.LOCAL_TAR_FILE} ubuntu@${env.REMOTE_HOST}:${env.REMOTE_DEPLOY_DIR}/
+                    """
+                }
+            }
+        }
+
+        stage('Extract TAR and Deploy on Remote') {
+            steps {
+                sshagent(credentials: [env.SSH_CRED]) {
+                    sh """
+                        echo "Connecting to remote server to extract and deploy..."
+                        ssh -o StrictHostKeyChecking=no ubuntu@${env.REMOTE_HOST} << EOF
+                            set -euo pipefail
+                            echo "Navigating to deployment directory: ${env.REMOTE_DEPLOY_DIR}"
+                            cd ${env.REMOTE_DEPLOY_DIR}
+
+                            echo "Extracting TAR file ${env.LOCAL_TAR_FILE}"
+                            tar -xf ${env.LOCAL_TAR_FILE}
+
+                            echo "Cleaning up existing containers and images"
+                            sudo docker rm -f ${env.CONTAINER_NAME} || true
+                            sudo docker rmi -f ${env.IMAGE_NAME} || true
+
+                            echo "Loading Docker image from TAR"
+                            sudo docker load -i ${env.LOCAL_TAR_FILE}
+
+                            echo "Starting container with: ${env.DOCKER_RUN_CMD}"
+                            ${env.DOCKER_RUN_CMD}
+
+                            echo "Deployment complete. Verifying container is running..."
+                            if sudo docker ps --filter "name=${env.CONTAINER_NAME}" --format "{{.Status}}" | grep -iq '^up'; then
+                                echo "✅ Container ${env.CONTAINER_NAME} is running."
+                            else
+                                echo "❌ Container ${env.CONTAINER_NAME} failed to start."
+                                sudo docker logs ${env.CONTAINER_NAME} || true
+                                exit 1
+                            fi
+                        EOF
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Deployment succeeded."
+        }
+        failure {
+            echo "❌ Deployment failed. Check pipeline logs."
+        }
+    }
+}
