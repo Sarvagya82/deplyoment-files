@@ -1,0 +1,138 @@
+pipeline {
+    agent any
+
+    environment {
+        SSH_CRED       = 'REPLACE_WITH_YOUR_SSH_CREDENTIAL_ID'           // Jenkins SSH credential ID
+        REMOTE_HOST    = 'ec2-XX-XX-XX-XX.region.compute.amazonaws.com'  // Remote server hostname or IP
+        REMOTE_FOLDER  = '/home/ubuntu/Dashboard-V2'                      // Deployment folder on remote server
+        GIT_REPO       = 'https://github.com/your-org/Dashboard-V2.git'   // Git repository URL
+        GIT_BRANCH     = 'UAT'                                            // Target Git branch for deployment
+        CONTAINER_NAME = 'liaplus-app'                                    // Docker container name
+        COMPOSE_CMD    = 'sudo docker compose up -d --build app'          // Docker Compose command to run
+        HANGOUTS_TOKEN = credentials('REPLACE_WITH_CHAT_TOKEN_CREDENTIAL')// Chat token credential ID for deployment notifications
+    }
+
+    options {
+        timestamps() // Adds timestamps to console output for easier debugging
+    }
+
+    stages {
+        stage('Notify: Deployment Start') {
+            steps {
+                // Notify deployment start to chat or notification platform
+                hangoutsNotify(
+                    message: "🚀 Starting Dashboard deployment (Build #${env.BUILD_NUMBER})",
+                    token: env.HANGOUTS_TOKEN,
+                    threadByJob: true
+                )
+            }
+        }
+
+        stage('Deploy over SSH') {
+            steps {
+                sshagent(credentials: [env.SSH_CRED]) {
+                    sh '''#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[INFO] Connecting to $REMOTE_HOST"
+
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no ubuntu@"$REMOTE_HOST" <<'EOF'
+set -euo pipefail
+
+echo "[STEP] Ensure prerequisites: Docker, Docker Compose, Git, AWS CLI, jq"
+command -v docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sudo sh
+docker compose version >/dev/null 2>&1 || { sudo apt-get update -y; sudo apt-get install -y docker-compose-plugin; }
+command -v git >/dev/null 2>&1 || { sudo apt-get update -y; sudo apt-get install -y git; }
+command -v aws >/dev/null 2>&1 || { sudo apt-get update -y; sudo apt-get install -y awscli jq; }
+
+echo "[STEP] Install or confirm CloudWatch Agent installation"
+if ! systemctl list-unit-files | grep -q amazon-cloudwatch-agent; then
+  sudo apt-get update -y
+  sudo apt-get install -y amazon-cloudwatch-agent || true
+fi
+
+echo "[STEP] Prepare deployment folder $REMOTE_FOLDER"
+sudo mkdir -p "$REMOTE_FOLDER"
+sudo chown -R ubuntu:ubuntu "$REMOTE_FOLDER"
+cd "$REMOTE_FOLDER"
+
+echo "[STEP] Sync Git repository from $GIT_REPO branch $GIT_BRANCH"
+if [ -d .git ]; then
+  git config --global --add safe.directory "$REMOTE_FOLDER" || true
+  git fetch --all --prune
+  git checkout "$GIT_BRANCH" 2>/dev/null || true
+  git reset --hard "origin/$GIT_BRANCH" || git reset --hard origin/master
+else
+  git clone "$GIT_REPO" "$REMOTE_FOLDER"
+  cd "$REMOTE_FOLDER"
+  git checkout "$GIT_BRANCH" 2>/dev/null || true
+fi
+
+echo "[STEP] Fetch environment variables securely from AWS Secrets Manager"
+aws secretsmanager get-secret-value \
+  --secret-id your-dashboard-uat-secret-id \
+  --query SecretString \
+  --output text | jq -r 'to_entries | map("\\(.key)=\\(.value)") | .[]' > .env
+
+chmod 600 .env
+chown ubuntu:ubuntu .env
+
+echo "[STEP] Cleanup old Docker containers and images"
+sudo docker compose down --remove-orphans || true
+sudo docker rm -f "$CONTAINER_NAME" || true
+sudo docker image prune -f || true
+
+echo "[STEP] Build and start application using Docker Compose"
+set +e
+$COMPOSE_CMD
+if [ $? -ne 0 ]; then
+  echo "[ERROR] Docker Compose command failed"
+  sudo docker compose logs --tail=50 || true
+  exit 1
+fi
+set -e
+
+echo "[STEP] Verify container $CONTAINER_NAME status"
+sleep 5
+if ! sudo docker ps --filter "name=$CONTAINER_NAME" --format "{{.Status}}" | grep -iq '^up'; then
+  echo "[ERROR] Container is not running"
+  sudo docker logs --tail=100 "$CONTAINER_NAME" || true
+  sudo docker compose ps
+  exit 1
+fi
+
+echo "[STEP] Update CloudWatch log symlinks and restart agent (if applicable)"
+if [ -x /usr/local/bin/update-docker-log-symlinks.sh ]; then
+  sudo /usr/local/bin/update-docker-log-symlinks.sh || true
+  sudo systemctl restart amazon-cloudwatch-agent || true
+else
+  echo "[WARN] Log symlink script not found, skipping"
+fi
+
+echo "[DONE] Deployment completed successfully"
+EOF
+'''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            hangoutsNotify(
+                message: "✅ Dashboard deployment SUCCESS (Build #${env.BUILD_NUMBER})",
+                token: env.HANGOUTS_TOKEN,
+                threadByJob: true
+            )
+            echo '✅ Deployment completed successfully.'
+        }
+        failure {
+            hangoutsNotify(
+                message: "❌ Dashboard deployment FAILED (Build #${env.BUILD_NUMBER}). See logs: ${env.BUILD_URL}",
+                token: env.HANGOUTS_TOKEN,
+                threadByJob: true
+            )
+            echo '❌ Deployment failed. Check logs for details.'
+        }
+    }
+}
