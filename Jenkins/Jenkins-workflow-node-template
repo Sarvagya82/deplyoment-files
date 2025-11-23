@@ -1,0 +1,103 @@
+pipeline {
+    agent any
+
+    environment {
+        SSH_CRED      = 'REPLACE_WITH_SSH_CREDENTIAL_ID'                 // Jenkins credential ID for SSH
+        REMOTE_HOST   = 'XX.XX.XX.XX'                                   // Remote server IP or hostname
+        BASE_DIR      = '/home/ubuntu/workflow-node-executor'           // Base directory on remote host
+        IMAGE_PREFIX  = 'workflow-node-executor'                        // Docker image name prefix
+        BRANCH       = 'main'                                           // Git branch to deploy from
+        TAR_NAME     = 'workflow-nodes-combined.tar'                    // TAR file name for combined images
+    }
+
+    stages {
+        stage('Build, Run & Bundle Workflow Nodes') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: env.SSH_CRED, usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                    script {
+                        def nodes = [
+                            'start', 'input', 'message', 'data-extractor',
+                            'condition', 'apicallnode', 'end', 'transfer'
+                        ]
+
+                        def ports = [
+                            'start': '50051',
+                            'input': '50054',
+                            'message': '50052',
+                            'data-extractor': '50055',
+                            'condition': '50056',
+                            'apicallnode': '50057',
+                            'end': '50058',
+                            'transfer': '50060'
+                        ]
+
+                        def images = []
+                        def cleanupCommands = []
+
+                        for (node in nodes) {
+                            def folder = node == "apicallnode" ? "${BASE_DIR}/apicallnode" : "${BASE_DIR}/${node}-node"
+                            def envFile = "${folder}/.env"
+                            def image = "${IMAGE_PREFIX}-${node}-node"
+                            def container = "workflow-${node}-node"
+                            def port = ports[node]
+
+                            images << image
+                            cleanupCommands << "sudo docker rm -f ${container} || true"
+                            cleanupCommands << "sudo docker rmi -f ${image} || true"
+
+                            sh """
+                                echo "Deploying workflow node: ${node}"
+                                sshpass -p "\$PASS" ssh -o StrictHostKeyChecking=no \$USER@${REMOTE_HOST} '
+                                    set -euo pipefail
+                                    cd ${folder}
+
+                                    echo "Syncing git branch ${BRANCH}"
+                                    git reset --hard
+                                    git fetch origin
+                                    git checkout ${BRANCH}
+                                    git pull origin ${BRANCH}
+
+                                    echo "Cleaning up old Docker container and image"
+                                    sudo docker rm -f ${container} || true
+                                    sudo docker rmi -f ${image} || true
+
+                                    echo "Building Docker image: ${image}"
+                                    sudo docker build -f Dockerfile.prod -t ${image} .
+
+                                    echo "Running container ${container} on port ${port} with .env"
+                                    sudo docker run -d --name ${container} -p ${port}:${port} -v ${envFile}:/app/.env ${image}
+
+                                    echo "Deployed ${container} successfully"
+                                '
+                            """
+                        }
+
+                        def saveImagesCmd = "sudo docker save ${images.join(' ')}"
+                        def tarOutput = "${BASE_DIR}/combined/${TAR_NAME}"
+
+                        sh """
+                            echo "Saving all workflow node images into single tarball"
+                            sshpass -p "\$PASS" ssh -o StrictHostKeyChecking=no \$USER@${REMOTE_HOST} '
+                                mkdir -p ${BASE_DIR}/combined
+                                cd ${BASE_DIR}
+                                ${saveImagesCmd} > ${tarOutput}
+                                sudo chmod 644 ${tarOutput}
+                                echo "Created combined tarball at ${tarOutput}"
+                                sleep 10
+                            '
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Workflow nodes built, deployed, and TAR created successfully."
+        }
+        failure {
+            echo "❌ Deployment failed. Check console logs for details."
+        }
+    }
+}
